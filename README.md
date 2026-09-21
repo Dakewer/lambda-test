@@ -1,20 +1,22 @@
 # Log processing system
 
 Sistema serverless que recibe logs en batches (~1KB), los procesa con una
-AWS Lambda y guarda el resultado como CSV en S3.
+AWS Lambda y guarda cada línea como un item en DynamoDB.
 
 ```mermaid
 flowchart LR
-    S31["s3://logging/input"] --> Lambda["Log processing"]
-    Lambda --> S32["s3://logging/output"]
+    S3["s3://logging/input"] --> Lambda["Log processing"]
+    Lambda --> DDB[("DynamoDB<br/>log-events")]
 ```
 
 1. Un batch (`.log`) se sube a `s3://logging/input/`.
 2. Esa escritura dispara la Lambda `log-processing` vía un S3 event trigger.
-3. La Lambda descarga el batch, parsea cada línea y genera un CSV con las
-   columnas `timestamp,hostname,program,pid,log`.
-4. El CSV se sube a `s3://logging/output/` con el mismo nombre base que el
-   `.log` original (p. ej. `openssh-1234567890.log` -> `openssh-1234567890.csv`).
+3. La Lambda descarga el batch, parsea cada línea y la clasifica por
+   `event_type` (`invalid_user`, `failed_password`, `break_in_attempt`...).
+4. Escribe un item por línea en la tabla `log-events` con `BatchWriteItem`.
+
+En la parte 1 la Lambda generaba un CSV y lo subía a `s3://logging/output/`;
+ahora escribe directo a DynamoDB, así que ya no existe el prefijo `output/`.
 
 ## Dataset
 
@@ -32,93 +34,103 @@ Dec 10 06:55:46 LabSZ sshd[24200]: input_userauth_request: invalid user webmaste
 ```
 ├── README.md
 ├── scripts
-│   ├── package-lambda.sh    # empaqueta + despliega la Lambda y su rol IAM, conecta el trigger S3
-│   ├── split-log.sh         # descarga el log y lo parte en batches de ~1KB: openssh-<timestamp>.log
-│   ├── send-logs.sh         # sube los batches a s3://logging/input/ cada N segundos
-│   ├── create-s3-bucket.sh  # crea el bucket "logging" con los prefijos input/ y output/
-│   └── teardown.sh          # elimina todo lo creado (bucket, Lambda, rol IAM)
+│   ├── create-s3-bucket.sh       # crea el bucket "logging" con el prefijo input/
+│   ├── create-dynamodb-table.sh  # crea la tabla log-events y su GSI
+│   ├── package-lambda.sh         # empaqueta + despliega la Lambda y su rol IAM, conecta el trigger S3
+│   ├── split-log.sh              # descarga el log y lo parte en batches de ~1KB: openssh-<timestamp>.log
+│   ├── send-logs.sh              # sube los batches a s3://logging/input/ cada N segundos
+│   └── teardown.sh               # elimina todo lo creado (bucket, tabla, Lambda, rol IAM)
 └── src
     └── logging-system
-        ├── lambda_function.py  # handler: descarga .log, genera .csv, sube a output/
+        ├── lambda_function.py    # handler: descarga el .log y escribe los items en DynamoDB
         └── requirements.txt
 ```
 
 ## Requisitos previos
 
-- AWS CLI v2 configurado (`aws configure`) con credenciales que puedan
-  crear buckets S3 y funciones Lambda.
+- AWS CLI v2 configurado (`aws configure`) con credenciales que puedan crear
+  buckets S3, tablas DynamoDB y funciones Lambda.
 - `python3`, `pip3` y `zip` instalados localmente (para empaquetar la Lambda).
 - `curl` (usado por `split-log.sh` para descargar el log de ejemplo si no
   existe localmente).
 
-El nombre de bucket `logging` es solo el default; como los nombres de
-bucket en S3 son únicos globalmente, si ya está tomado pásalo como
-argumento o exporta `BUCKET_NAME=tu-nombre-unico` antes de correr los
-scripts (todos lo respetan).
+El nombre de bucket `logging-bucket-1321` es solo el default; como los
+nombres de bucket en S3 son únicos globalmente, si ya está tomado exporta
+`BUCKET_NAME=tu-nombre-unico` antes de correr los scripts (todos lo
+respetan) y úsalo en todos los pasos. Lo mismo con `TABLE_NAME` (default
+`log-events`), que `package-lambda.sh` le pasa a la Lambda como variable de
+entorno.
 
-### Rol IAM de la Lambda
+`package-lambda.sh` crea su propio rol IAM (`log-processing-lambda-role`)
+con permisos de lectura sobre `input/*` y de escritura en la tabla. En
+cuentas restringidas donde no se permite `iam:CreateRole` (p. ej. AWS
+Academy) usa automáticamente el rol existente `LabRole`, y `teardown.sh`
+nunca borra un rol que no haya creado él mismo.
 
-`package-lambda.sh` intenta crear su propio rol IAM (`ROLE_NAME`, default
-`log-processing-lambda-role`). En cuentas restringidas donde no se permite
-`iam:CreateRole` (p. ej. **AWS Academy Learner Lab**, que usa `voclabs`),
-el script cae automáticamente a un rol ya existente en la cuenta —
-`FALLBACK_ROLE_NAME` (default `LabRole`, el rol estándar de AWS Academy).
-`teardown.sh` nunca borra un rol que no haya creado él mismo (lo rastrea
-con un marcador en `build/`), así que `LabRole` u otro rol compartido
-siempre queda intacto.
-
-### Trigger S3 -> Lambda
-
-`package-lambda.sh` configura el trigger que pide el enunciado: una
-notificación S3 -> Lambda directa (`s3api put-bucket-notification-configuration`
-con `LambdaFunctionConfigurations`, más el permiso correspondiente vía
-`lambda add-permission` para que S3 pueda invocar la función).
+El trigger es una notificación S3 -> Lambda directa. Si falla al
+configurarse desde la CLI, el script sigue e imprime el error para poder
+crearla a mano: Bucket > Properties > Event notifications, prefijo
+`input/`, sufijo `.log`, destino la función `log-processing`.
 
 ## Uso
 
 ```bash
-# 1. Crear el bucket S3 "logging" con input/ y output/
+# 1. Crear el bucket S3 con el prefijo input/
 ./scripts/create-s3-bucket.sh
 
-# 2. Partir el log de OpenSSH en batches de ~1KB
-#    -> genera ./batches/openssh-<timestamp>.log
+# 2. Crear la tabla DynamoDB "log-events"
+./scripts/create-dynamodb-table.sh
+
+# 3. Partir el log de OpenSSH en batches de ~1KB -> ./batches/openssh-<timestamp>.log
 ./scripts/split-log.sh
 
-# 3. Empaquetar y desplegar la Lambda (crea rol IAM, función y el trigger S3)
+# 4. Empaquetar y desplegar la Lambda (rol IAM, función y trigger S3)
 ./scripts/package-lambda.sh
 
-# 4. Enviar los batches a s3://logging/input/, uno cada N segundos
-./scripts/send-logs.sh 30
+# 5. Enviar los batches a s3://logging/input/, uno cada 60 segundos
+./scripts/send-logs.sh 60
 
-# Verificar los CSV generados
-aws s3 ls s3://logging/output/
-
-# 5. (Opcional) eliminar todos los recursos creados
+# 6. (Opcional) eliminar todos los recursos creados
 ./scripts/teardown.sh
 ```
 
-Todos los scripts aceptan configuración por variables de entorno
-(`BUCKET_NAME`, `FUNCTION_NAME`, `ROLE_NAME`, `AWS_REGION`); revisa el
-encabezado de cada `.sh` para ver el detalle de uso y defaults.
+## Modelo de datos
 
-## Formato de salida
+Tabla `log-events`, un item por línea de log:
 
-Cada línea del `.log` de entrada, con formato syslog:
+| Atributo           | Ejemplo                       | Notas                                 |
+| ------------------ | ----------------------------- | ------------------------------------- |
+| `pk`               | `LabSZ#sshd`                  | Partition key: `<hostname>#<program>` |
+| `sk`               | `openssh-1789440570#00007`    | Sort key: `<batch_id>#<línea>`        |
+| `event_type`       | `invalid_user`                | Partition key del GSI                 |
+| `ingested_at`      | `2026-09-21T18:04:11Z`        | Sort key del GSI                      |
+| `src_ip`           | `173.234.31.186`              | Solo si la línea trae IP              |
+| `syslog_timestamp` | `Dec 10 06:55:46`             | La hora que trae el log               |
+| `hostname`         | `LabSZ`                       |                                       |
+| `program`          | `sshd`                        |                                       |
+| `message`          | `Invalid user webmaster from…`| El mensaje sin la metadata syslog     |
 
-```
-Mmm DD HH:MM:SS hostname programa[pid]: mensaje
-```
+La `sk` es determinista (batch + número de línea), así que si S3 vuelve a
+disparar la Lambda con el mismo batch el item se sobrescribe en lugar de
+duplicarse.
 
-se convierte en una fila del CSV de salida:
+El GSI `event_type-index` permite consultar por tipo de evento con Query en
+lugar de recorrer toda la tabla con Scan. Es GSI y no LSI porque su
+partition key es distinta a la de la tabla.
 
-```csv
-timestamp,hostname,program,pid,log
-Dec 10 06:55:46,LabSZ,sshd,24200,Invalid user webmaster from 173.234.31.186
-```
+## Validación
 
-Si una línea no matchea el formato esperado no se descarta: se guarda con
-las columnas de metadata vacías y el texto completo en `log`, y se deja un
-warning en CloudWatch Logs para poder revisarla.
+Con `./scripts/send-logs.sh 60` corriendo (un batch por minuto), desde la
+consola de AWS:
+
+1. DynamoDB > Tables > `log-events` > **Explore table items**.
+2. Selecciona **Query** y, en el índice, **`event_type-index`**.
+3. `event_type` = `invalid_user` > **Run**.
+4. Espera al siguiente batch y vuelve a correr la misma query: el número de
+   items crece porque están llegando logs nuevos.
+
+Los logs de la Lambda están en CloudWatch (`/aws/lambda/log-processing`),
+con una línea por batch procesado.
 
 ## Equipo
 

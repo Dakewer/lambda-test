@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# teardown.sh — removes everything create-s3-bucket.sh and
-# package-lambda.sh created: the S3 notification, the Lambda function,
-# the IAM role (if this project created it), and the S3 bucket itself
-# (including its contents).
+# teardown.sh — removes everything the infrastructure scripts created:
+# the S3 notification, the Lambda function, the IAM role (if this project
+# created it), the DynamoDB table and the S3 bucket itself (including its
+# contents).
 #
 # Usage:
 #   ./scripts/teardown.sh
 set -uo pipefail
 
 FUNCTION_NAME="${FUNCTION_NAME:-log-processing}"
-BUCKET_NAME="${BUCKET_NAME:-logging}"
+BUCKET_NAME="${BUCKET_NAME:-logging-bucket-1321}"
+TABLE_NAME="${TABLE_NAME:-log-events}"
 ROLE_NAME="${ROLE_NAME:-log-processing-lambda-role}"
 
 BUILD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../build"
@@ -37,6 +38,10 @@ if [ -f "${ROLE_MARKER}" ] && [ "$(cat "${ROLE_MARKER}")" = "${ROLE_NAME}" ]; th
 else
   echo "Role ${ROLE_NAME} was not created by this project (or marker missing), leaving it untouched."
 fi
+
+echo "== Deleting DynamoDB table =="
+aws dynamodb delete-table --table-name "${TABLE_NAME}" >/dev/null 2>&1 \
+  && echo "Deleted table ${TABLE_NAME}." || echo "Table not found, skipping."
 
 echo "== Emptying and deleting S3 bucket =="
 aws s3 rm "s3://${BUCKET_NAME}" --recursive 2>/dev/null || true

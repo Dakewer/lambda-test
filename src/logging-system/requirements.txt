@@ -1,4 +1,2 @@
-# No external dependencies required.
-# boto3 / botocore are already provided by the AWS Lambda Python runtime,
-# and everything else used by lambda_function.py is standard library
-# (csv, io, re, os, urllib.parse, logging).
+# Sin dependencias externas: boto3 (S3 y DynamoDB) ya viene incluido en el
+# runtime de Python de AWS Lambda, y lo demás es librería estándar.

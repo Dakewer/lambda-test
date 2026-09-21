@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # package-lambda.sh — zips src/logging-system, creates the Lambda's IAM
 # role if needed, creates (or updates) the "log-processing" Lambda
-# function, and wires up a direct S3 -> Lambda trigger on
-# s3://<bucket>/input/*.log uploads.
+# function (pointing it at the DynamoDB table), and wires up a direct
+# S3 -> Lambda trigger on s3://<bucket>/input/*.log uploads.
 #
 # Usage:
 #   ./scripts/package-lambda.sh
 #
 # Config (env vars, all optional):
 #   FUNCTION_NAME     (default: log-processing)
-#   BUCKET_NAME       (default: logging)
+#   BUCKET_NAME       (default: logging-bucket-1321)
+#   TABLE_NAME        (default: log-events) — la tabla creada por
+#                      ./scripts/create-dynamodb-table.sh
 #   ROLE_NAME         (default: log-processing-lambda-role)
 #   FALLBACK_ROLE_NAME (default: LabRole) — used automatically when this
 #                      account can't create IAM roles (e.g. AWS Academy /
@@ -20,7 +22,8 @@
 set -euo pipefail
 
 FUNCTION_NAME="${FUNCTION_NAME:-log-processing}"
-BUCKET_NAME="${BUCKET_NAME:-logging}"
+BUCKET_NAME="${BUCKET_NAME:-logging-bucket-1321}"
+TABLE_NAME="${TABLE_NAME:-log-events}"
 ROLE_NAME="${ROLE_NAME:-log-processing-lambda-role}"
 FALLBACK_ROLE_NAME="${FALLBACK_ROLE_NAME:-LabRole}"
 RUNTIME="python3.12"
@@ -77,7 +80,7 @@ else
         \"Version\": \"2012-10-17\",
         \"Statement\": [
           {\"Effect\": \"Allow\", \"Action\": [\"s3:GetObject\"], \"Resource\": \"arn:aws:s3:::${BUCKET_NAME}/input/*\"},
-          {\"Effect\": \"Allow\", \"Action\": [\"s3:PutObject\"], \"Resource\": \"arn:aws:s3:::${BUCKET_NAME}/output/*\"}
+          {\"Effect\": \"Allow\", \"Action\": [\"dynamodb:PutItem\", \"dynamodb:BatchWriteItem\"], \"Resource\": \"arn:aws:dynamodb:*:*:table/${TABLE_NAME}\"}
         ]
       }"
 
@@ -110,7 +113,11 @@ if aws lambda get-function --function-name "${FUNCTION_NAME}" >/dev/null 2>&1; t
   aws lambda update-function-code --function-name "${FUNCTION_NAME}" \
     --zip-file "fileb://${ZIP_FILE}" >/dev/null
   aws lambda wait function-updated --function-name "${FUNCTION_NAME}"
-  echo "Updated code for existing function ${FUNCTION_NAME}."
+  # TABLE_NAME va como variable de entorno, hay que actualizarla también.
+  aws lambda update-function-configuration --function-name "${FUNCTION_NAME}" \
+    --environment "Variables={TABLE_NAME=${TABLE_NAME}}" >/dev/null
+  aws lambda wait function-updated --function-name "${FUNCTION_NAME}"
+  echo "Updated code and configuration for existing function ${FUNCTION_NAME}."
 else
   aws lambda create-function --function-name "${FUNCTION_NAME}" \
     --runtime "${RUNTIME}" \
@@ -118,6 +125,7 @@ else
     --handler "${HANDLER}" \
     --timeout "${TIMEOUT}" \
     --memory-size "${MEMORY}" \
+    --environment "Variables={TABLE_NAME=${TABLE_NAME}}" \
     --zip-file "fileb://${ZIP_FILE}" >/dev/null
   aws lambda wait function-active --function-name "${FUNCTION_NAME}"
   echo "Created function ${FUNCTION_NAME}."
@@ -134,7 +142,7 @@ aws lambda add-permission --function-name "${FUNCTION_NAME}" \
   --source-arn "arn:aws:s3:::${BUCKET_NAME}" \
   --source-account "${ACCOUNT_ID}" >/dev/null 2>&1 || echo "Invoke permission already granted."
 
-aws s3api put-bucket-notification-configuration --bucket "${BUCKET_NAME}" \
+if aws s3api put-bucket-notification-configuration --bucket "${BUCKET_NAME}" \
   --notification-configuration "{
     \"LambdaFunctionConfigurations\": [{
       \"LambdaFunctionArn\": \"${FUNCTION_ARN}\",
@@ -144,7 +152,20 @@ aws s3api put-bucket-notification-configuration --bucket "${BUCKET_NAME}" \
         {\"Name\": \"suffix\", \"Value\": \".log\"}
       ]}}
     }]
-  }"
+  }" 2>/tmp/package-lambda-notify.err; then
+  echo "S3 -> Lambda notification configured."
+else
+  echo "Could not set the S3 notification via CLI. First check BUCKET_NAME='${BUCKET_NAME}'"
+  echo "is actually the bucket you created (AccessDenied on S3 usually means you're"
+  echo "pointing at a bucket you don't own, not a real permissions problem). If the"
+  echo "bucket is right and this still fails, configure it by hand from the S3"
+  echo "console — Bucket > Properties > Event notifications > Create event"
+  echo "notification, prefix 'input/', suffix '.log', all object-create events,"
+  echo "destination: the ${FUNCTION_NAME} Lambda):"
+  cat /tmp/package-lambda-notify.err
+  echo "Continuing — if you already set the trigger by hand, this is expected and harmless."
+fi
 
 echo "Done. Function ready: ${FUNCTION_ARN}"
-echo "Uploads to s3://${BUCKET_NAME}/input/*.log will now trigger ${FUNCTION_NAME}."
+echo "Uploads to s3://${BUCKET_NAME}/input/*.log will now trigger ${FUNCTION_NAME},"
+echo "which writes one item per log line into the DynamoDB table ${TABLE_NAME}."

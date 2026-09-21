@@ -18,7 +18,7 @@ fi
 
 WAIT_SECONDS="$1"
 BATCHES_DIR="${2:-batches}"
-BUCKET_NAME="${3:-${BUCKET_NAME:-logging}}"
+BUCKET_NAME="${3:-${BUCKET_NAME:-logging-bucket-1321}}"
 
 shopt -s nullglob
 FILES=("${BATCHES_DIR}"/openssh-*.log)

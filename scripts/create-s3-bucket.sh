@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # create-s3-bucket.sh — creates the "logging" S3 bucket (bucket names are
 # globally unique in AWS, override with BUCKET_NAME or a first argument if
-# "logging" is already taken) with input/ and output/ prefixes, blocking
-# public access.
+# "logging" is already taken) with el prefijo input/, blocking public
+# access. Ya no hay prefijo output/: la Lambda escribe a DynamoDB.
 #
 # Usage:
 #   ./scripts/create-s3-bucket.sh [bucket_name]
 set -euo pipefail
 
-BUCKET_NAME="${1:-${BUCKET_NAME:-logging}}"
+BUCKET_NAME="${1:-${BUCKET_NAME:-logging-bucket-1321}}"
 REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
 
 echo "Creating bucket '${BUCKET_NAME}' in region '${REGION}'..."
@@ -30,8 +30,7 @@ else
   echo "Bucket '${BUCKET_NAME}' created."
 fi
 
-echo "Creating input/ and output/ prefixes..."
+echo "Creating input/ prefix..."
 aws s3api put-object --bucket "${BUCKET_NAME}" --key "input/" >/dev/null
-aws s3api put-object --bucket "${BUCKET_NAME}" --key "output/" >/dev/null
 
 echo "Done. Bucket ready at s3://${BUCKET_NAME}"
