@@ -72,6 +72,27 @@ configurarse desde la CLI, el script sigue e imprime el error para poder
 crearla a mano: Bucket > Properties > Event notifications, prefijo
 `input/`, sufijo `.log`, destino la función `log-processing`.
 
+### Desde WSL
+
+El proyecto se ve en `/mnt/c`, y los scripts se invocan con `bash` porque
+en esa ruta el bit de ejecución no siempre persiste (con
+`chmod +x scripts/*.sh` puedes usar `./scripts/...`):
+
+```bash
+cd "/mnt/c/Users/<usuario>/Downloads/Desarrollo en la nube/lambda-test"
+bash scripts/create-s3-bucket.sh
+```
+
+Dos cosas que muerden:
+
+- Si un script falla con `set: pipefail: invalid option name`, el archivo
+  se guardó con finales de línea CRLF. Se arregla con
+  `sed -i 's/\r$//' scripts/*.sh`.
+- WSL tiene su propio `~/.aws`, así que hay que correr `aws configure`
+  dentro de WSL. En AWS Academy hay que pegar ahí las tres líneas del
+  Learner Lab (`aws_access_key_id`, `aws_secret_access_key` y
+  `aws_session_token`), que expiran en cada sesión.
+
 ## Uso
 
 ```bash
@@ -120,17 +141,26 @@ partition key es distinta a la de la tabla.
 
 ## Validación
 
-Con `./scripts/send-logs.sh 60` corriendo (un batch por minuto), desde la
-consola de AWS:
+Con `./scripts/send-logs.sh 60` corriendo (un batch por minuto), todo se
+puede seguir desde la consola de AWS.
 
-1. DynamoDB > Tables > `log-events` > **Explore table items**.
-2. Selecciona **Query** y, en el índice, **`event_type-index`**.
-3. `event_type` = `invalid_user` > **Run**.
-4. Espera al siguiente batch y vuelve a correr la misma query: el número de
+**La query de la entrega.** DynamoDB > Tables > `log-events` > **Explore
+table items**:
+
+1. Selecciona **Query** y, en el selector de índice, **`event_type-index`**.
+2. `event_type` = `invalid_user` > **Run**.
+3. Espera al siguiente batch y vuelve a correr la misma query: el número de
    items crece porque están llegando logs nuevos.
 
-Los logs de la Lambda están en CloudWatch (`/aws/lambda/log-processing`),
-con una línea por batch procesado.
+**Los items de un batch en particular.** En la misma pantalla, Query sobre
+la tabla (sin índice): `pk` = `LabSZ#sshd`, y en la sort key la condición
+**Begins with** con `openssh-<timestamp>#`.
+
+**El batch original.** S3 > `logging-bucket-1321` > `input/` > clic en el
+`.log` > **Open**. Si el navegador no lo muestra, **Download**.
+
+**Los logs de la Lambda.** CloudWatch > Log groups >
+`/aws/lambda/log-processing`, con una línea por batch procesado.
 
 ## Equipo
 
