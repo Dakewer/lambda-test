@@ -1,0 +1,159 @@
+{
+  "Comment": "State machine para procesar batches de logs y separar alertas sospechosas en DynamoDB",
+  "StartAt": "ParseBatch",
+  "States": {
+    "ParseBatch": {
+      "Type": "Task",
+      "Resource": "${PARSE_BATCH_LAMBDA_ARN}",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Next": "ProcessLogLines"
+    },
+    "ProcessLogLines": {
+      "Type": "Map",
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
+        "StartAt": "ClassifyLog",
+        "States": {
+          "ClassifyLog": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Or": [
+                  {
+                    "Variable": "$.message",
+                    "StringMatches": "*Invalid user*"
+                  },
+                  {
+                    "Variable": "$.message",
+                    "StringMatches": "*POSSIBLE BREAK-IN ATTEMPT*"
+                  }
+                ],
+                "Next": "WriteSecurityAlert"
+              }
+            ],
+            "Default": "WriteLog"
+          },
+          "WriteSecurityAlert": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::dynamodb:putItem",
+            "Parameters": {
+              "TableName": "${SECURITY_ALERTS_TABLE_NAME}",
+              "Item": {
+                "pk": {
+                  "S.$": "$.pk"
+                },
+                "sk": {
+                  "S.$": "$.sk"
+                },
+                "event_type": {
+                  "S.$": "$.event_type"
+                },
+                "ingested_at": {
+                  "S.$": "$.ingested_at"
+                },
+                "hostname": {
+                  "S.$": "$.hostname"
+                },
+                "program": {
+                  "S.$": "$.program"
+                },
+                "pid": {
+                  "S.$": "$.pid"
+                },
+                "src_ip": {
+                  "S.$": "$.src_ip"
+                },
+                "syslog_timestamp": {
+                  "S.$": "$.syslog_timestamp"
+                },
+                "message": {
+                  "S.$": "$.message"
+                }
+              }
+            },
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "DynamoDB.ProvisionedThroughputExceededException",
+                  "ProvisionedThroughputExceededException",
+                  "DynamoDB.AmazonDynamoDBException"
+                ],
+                "IntervalSeconds": 1,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              }
+            ],
+            "End": true
+          },
+          "WriteLog": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::dynamodb:putItem",
+            "Parameters": {
+              "TableName": "${LOGS_TABLE_NAME}",
+              "Item": {
+                "pk": {
+                  "S.$": "$.pk"
+                },
+                "sk": {
+                  "S.$": "$.sk"
+                },
+                "event_type": {
+                  "S.$": "$.event_type"
+                },
+                "ingested_at": {
+                  "S.$": "$.ingested_at"
+                },
+                "hostname": {
+                  "S.$": "$.hostname"
+                },
+                "program": {
+                  "S.$": "$.program"
+                },
+                "pid": {
+                  "S.$": "$.pid"
+                },
+                "src_ip": {
+                  "S.$": "$.src_ip"
+                },
+                "syslog_timestamp": {
+                  "S.$": "$.syslog_timestamp"
+                },
+                "message": {
+                  "S.$": "$.message"
+                }
+              }
+            },
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "DynamoDB.ProvisionedThroughputExceededException",
+                  "ProvisionedThroughputExceededException",
+                  "DynamoDB.AmazonDynamoDBException"
+                ],
+                "IntervalSeconds": 1,
+                "MaxAttempts": 3,
+                "BackoffRate": 2.0
+              }
+            ],
+            "End": true
+          }
+        }
+      },
+      "End": true
+    }
+  }
+}

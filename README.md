@@ -35,15 +35,21 @@ Dec 10 06:55:46 LabSZ sshd[24200]: input_userauth_request: invalid user webmaste
 ├── README.md
 ├── scripts
 │   ├── create-s3-bucket.sh       # crea el bucket "logging" con el prefijo input/
-│   ├── create-dynamodb-table.sh  # crea la tabla log-events y su GSI
-│   ├── package-lambda.sh         # empaqueta + despliega la Lambda y su rol IAM, conecta el trigger S3
+│   ├── create-dynamodb-table.sh  # crea las tablas DynamoDB "Logs" y "SecurityAlerts" (y soporte para log-events)
+│   ├── deploy-state-machine.sh   # Parte 3: empaqueta Lambda parse-batch, despliega State Machine y regla EventBridge
+│   ├── package-lambda.sh         # Parte 2: empaqueta + despliega Lambda monolítica y trigger directo S3 (referencia)
 │   ├── split-log.sh              # descarga el log y lo parte en batches de ~1KB: openssh-<timestamp>.log
 │   ├── send-logs.sh              # sube los batches a s3://logging/input/ cada N segundos
-│   └── teardown.sh               # elimina todo lo creado (bucket, tabla, Lambda, rol IAM)
+│   └── teardown.sh               # elimina todo lo creado (Step Functions, EventBridge, Lambdas, tablas, bucket)
 └── src
-    └── logging-system
-        ├── lambda_function.py    # handler: descarga el .log y escribe los items en DynamoDB
-        └── requirements.txt
+    ├── logging-system            # Parte 2: Lambda monolítica anterior (referencia histórica)
+    │   ├── lambda_function.py
+    │   └── requirements.txt
+    ├── parse-batch               # Parte 3: Lambda enfocada exclusivamente en parsear el batch
+    │   ├── lambda_function.py
+    │   └── requirements.txt
+    └── step-functions            # Parte 3: Definición ASL de la State Machine
+        └── state-machine.asl.json
 ```
 
 ## Requisitos previos
@@ -93,7 +99,125 @@ Dos cosas que muerden:
   Learner Lab (`aws_access_key_id`, `aws_secret_access_key` y
   `aws_session_token`), que expiran en cada sesión.
 
-## Uso
+## Parte 3: Step Functions
+
+En esta fase, la arquitectura evoluciona hacia una solución serverless desacoplada y orientada a eventos mediante **AWS Step Functions** y **Amazon EventBridge**.
+
+> **Nota importante:**
+> Este flujo basado en Step Functions **reemplaza por completo el trigger directo S3 -> Lambda de la parte 2**.
+> Los scripts y código de la parte 2 (`scripts/package-lambda.sh` y `src/logging-system/`) se conservan exclusivamente como **referencia histórica de la evolución arquitectónica**, pero ya no se utilizan en producción una vez desplegado Step Functions.
+
+### Diagrama del flujo
+
+```mermaid
+flowchart TD
+    S3["S3 Bucket: s3://logging-bucket-1321/input/*.log<br/>(EventBridge Notifications)"] -->|aws.s3: Object Created| EBR["EventBridge Rule<br/>s3-log-processing-rule"]
+    EBR -->|InputTransformer: bucket + key| SFN["Step Functions State Machine<br/>log-processing-state-machine"]
+
+    subgraph SFN_Workflow["State Machine: log-processing-state-machine"]
+        SFN --> PB["Task: ParseBatch<br/>(Lambda parse-batch)"]
+        PB -->|Arreglo de eventos parseados| Map["Map State: ProcessLogLines<br/>(Modo Inline)"]
+
+        subgraph MapProcessor["ItemProcessor (Iteración por línea de log)"]
+            Map --> Choice{"Choice: ClassifyLog<br/>¿Mensaje sospechoso?<br/>(Invalid user / Break-in attempt)"}
+            Choice -->|Sospechoso| WriteSec["Task: WriteSecurityAlert<br/>arn:aws:states:::dynamodb:putItem"]
+            Choice -->|Normal / Default| WriteLog["Task: WriteLog<br/>arn:aws:states:::dynamodb:putItem"]
+        end
+    end
+
+    WriteSec -->|PutItem directo| SecTable[("DynamoDB Table<br/>SecurityAlerts")]
+    WriteLog -->|PutItem directo| LogsTable[("DynamoDB Table<br/>Logs")]
+```
+
+### ¿Por qué se separó `parse_batch` de la clasificación y escritura?
+
+1. **Separación de responsabilidades (Single Responsibility Principle):**
+   En la arquitectura anterior, una única Lambda monolítica descargaba el archivo, aplicaba expresiones regulares, evaluaba reglas de clasificación y realizaba llamadas de red a DynamoDB. Al separar `parse-batch`, la función Lambda se enfoca exclusivamente en descargar el archivo desde S3 y descomponer el texto en registros estructurados con regex. Toda la lógica de control de flujo, branching condicional y orquestación se delega al motor declarativo de Step Functions.
+2. **Integraciones directas de Step Functions a DynamoDB (SDK Integrations sin código):**
+   Step Functions se conecta directamente a DynamoDB mediante `arn:aws:states:::dynamodb:putItem`. Esto elimina la necesidad de código intermedio (*glue code*) en Python, reduce la superficie de bugs, evita reservar memoria y CPU en funciones Lambda para esperar I/O de red de base de datos, y disminuye los costos operativos de cómputo.
+3. **Resiliencia declarativa y manejo de retries para throttling:**
+   Cuando múltiples batches se procesan concurrentemente, pueden generarse ráfagas de escritura que excedan la capacidad o provoquen `ProvisionedThroughputExceededException` o `DynamoDB.AmazonDynamoDBException`. La máquina de estados gestiona reintentos exponenciales automáticos de forma nativa (`IntervalSeconds: 1`, `BackoffRate: 2.0`, `MaxAttempts: 3`), protegiendo el sistema contra pérdida de datos sin ensuciar la lógica de negocio con bucles de reintento manuales.
+4. **Aislamiento físico y seguridad (Defense in Depth):**
+   Separar los eventos anómalos o sospechosos (`*Invalid user*`, `*POSSIBLE BREAK-IN ATTEMPT*`) en una tabla dedicada `SecurityAlerts` aislada de `Logs` permite:
+   - Auditar eventos críticos de seguridad con latencias mínimas y sin la sobrecarga de consultar millones de logs rutinarios.
+   - Definir políticas de acceso IAM más estrictas sobre la tabla de seguridad.
+   - Habilitar alarmas específicas o flujos de respuesta ante incidentes (por ejemplo, triggers secundarios hacia SNS o SIEM) únicamente sobre `SecurityAlerts`.
+   - Establecer políticas de retención (TTL) diferenciadas para cada categoría de log.
+
+### Instrucciones de uso paso a paso
+
+#### 1. Crear las tablas DynamoDB (`Logs` y `SecurityAlerts`)
+Crea ambas tablas en modo bajo demanda (`PAY_PER_REQUEST`) con sus índices secundarios globales (`event_type-index`):
+```bash
+./scripts/create-dynamodb-table.sh
+```
+*(Opcional: puedes personalizar los nombres definiendo `LOGS_TABLE_NAME` y `SECURITY_ALERTS_TABLE_NAME`)*.
+
+#### 2. Desplegar la State Machine y componentes serverless
+Ejecuta el script de despliegue automatizado:
+```bash
+./scripts/deploy-state-machine.sh
+```
+Este script realiza de forma idéntica y reproducible:
+- El empaquetado y despliegue de la función Lambda `parse-batch`.
+- La creación de los roles IAM requeridos (o conmutación automática a `LabRole` en entornos restringidos como AWS Academy).
+- La creación o actualización de la State Machine `log-processing-state-machine` en Step Functions (inyectando ARNs y nombres de tabla en la definición ASL).
+- La activación de notificaciones EventBridge en el bucket S3 (`put-bucket-notification-configuration`).
+- La creación de la regla EventBridge `s3-log-processing-rule` con su target hacia la State Machine y transformación de parámetros (`InputTransformer`).
+
+#### 3. Enviar logs hacia S3
+Si no tienes los batches descargados y divididos, généralos primero:
+```bash
+./scripts/split-log.sh
+```
+Luego inicia la subida periódica de batches al prefijo `input/` de S3:
+```bash
+# Sube un batch cada 60 segundos
+./scripts/send-logs.sh 60
+```
+Cada subida emitirá un evento en EventBridge que iniciará automáticamente una nueva ejecución en Step Functions.
+
+#### 4. Revisar ejecuciones en Step Functions Console (Graph View)
+1. En la consola de AWS, navega a **Step Functions** > **State machines** y haz clic en **`log-processing-state-machine`**.
+2. En la pestaña **Executions**, selecciona la ejecución más reciente en la lista.
+3. En la sección **Graph view**, observa el flujo visual:
+   - El estado de tarea `ParseBatch` en verde, que extrae y entrega el arreglo de líneas a `ProcessLogLines`.
+   - Haz clic sobre el estado `Map` (`ProcessLogLines`) para inspeccionar las ejecuciones concurrentes de cada registro del batch.
+   - En el subflujo, visualiza cómo el estado `Choice` (`ClassifyLog`) bifurca cada ítem: los registros con intentos de intrusión o usuarios inválidos fluyen a `WriteSecurityAlert`, mientras que los logs normales fluyen a `WriteLog`.
+4. En la pestaña **Execution input and output**, puedes validar el payload estructurado provisto por EventBridge (`{"bucket": "...", "key": "..."}`) y la salida del proceso.
+
+#### 5. Consultar y verificar ambas tablas en DynamoDB Console
+En la consola de AWS, navega a **DynamoDB** > **Tables**:
+- **Tabla `SecurityAlerts`:**
+  1. Selecciona **`SecurityAlerts`** > pestaña **Explore table items**.
+  2. Verifica que solo contiene eventos clasificados como sospechosos (`break_in_attempt`, `invalid_user`).
+  3. Cambia la opción a **Query**, selecciona el índice **`event_type-index`** y consulta con `event_type = break_in_attempt` para auditar intentos de intrusión ordenados temporalmente.
+- **Tabla `Logs`:**
+  1. Selecciona **`Logs`** > pestaña **Explore table items**.
+  2. Comprueba que contiene los logs ordinarios (desconexiones, actividad de sshd regular, etc.).
+  3. Realiza una **Query** en la tabla con la partition key `pk = LabSZ#sshd` y en la sort key `sk` la condición **Begins with** `openssh-` para ver todos los logs de un host o batch en particular.
+
+#### 6. Limpieza de recursos (Teardown)
+Cuando finalices la práctica o quieras limpiar la cuenta, ejecuta:
+```bash
+./scripts/teardown.sh
+```
+Este script elimina de manera segura:
+- La regla EventBridge `s3-log-processing-rule` y su target `StepFunctionsTarget`.
+- La State Machine `log-processing-state-machine` en Step Functions.
+- Las funciones Lambda `parse-batch` y `log-processing`.
+- Los roles IAM creados específicamente por el proyecto (verificados mediante marcadores en `build/`).
+- Las tablas DynamoDB `Logs`, `SecurityAlerts` y `log-events`.
+- El contenido del bucket S3 y el bucket en sí.
+- Los artefactos temporales en `build/`.
+
+---
+
+## Parte 2 (Referencia histórica): Flujo S3 -> Lambda -> DynamoDB
+
+> Esta sección documenta la arquitectura anterior de la Parte 2. Para el flujo de producción actual, consulta la [Parte 3: Step Functions](#parte-3-step-functions).
+
+### Uso (Parte 2)
 
 ```bash
 # 1. Crear el bucket S3 con el prefijo input/
@@ -117,7 +241,7 @@ Dos cosas que muerden:
 
 ## Modelo de datos
 
-Tabla `log-events`, un item por línea de log:
+Las tablas `Logs` y `SecurityAlerts` de la Parte 3 (al igual que la tabla `log-events` de la Parte 2) comparten la misma estructura de datos, un item por línea de log:
 
 | Atributo           | Ejemplo                       | Notas                                 |
 | ------------------ | ----------------------------- | ------------------------------------- |
