@@ -22,26 +22,64 @@
     },
     "ProcessLogLines": {
       "Type": "Map",
+      "MaxConcurrency": 10,
       "ItemProcessor": {
         "ProcessorConfig": {
           "Mode": "INLINE"
         },
-        "StartAt": "ClassifyLog",
+        "StartAt": "ClassifyLine",
         "States": {
-          "ClassifyLog": {
+          "ClassifyLine": {
             "Type": "Choice",
+            "Comment": "Clasifica la línea: sospechosa si contiene POSSIBLE BREAK-IN ATTEMPT o Invalid user",
             "Choices": [
               {
-                "Or": [
-                  {
-                    "Variable": "$.message",
-                    "StringMatches": "*Invalid user*"
-                  },
-                  {
-                    "Variable": "$.message",
-                    "StringMatches": "*POSSIBLE BREAK-IN ATTEMPT*"
-                  }
-                ],
+                "Variable": "$.message",
+                "StringMatches": "*POSSIBLE BREAK-IN ATTEMPT*",
+                "Next": "MarkBreakInAttempt"
+              },
+              {
+                "Variable": "$.message",
+                "StringMatches": "*Invalid user*",
+                "Next": "MarkInvalidUser"
+              }
+            ],
+            "Default": "MarkNormal"
+          },
+          "MarkBreakInAttempt": {
+            "Type": "Pass",
+            "Result": {
+              "label": "suspicious",
+              "severity": "HIGH"
+            },
+            "ResultPath": "$.classification",
+            "Next": "RouteByClassification"
+          },
+          "MarkInvalidUser": {
+            "Type": "Pass",
+            "Result": {
+              "label": "suspicious",
+              "severity": "MEDIUM"
+            },
+            "ResultPath": "$.classification",
+            "Next": "RouteByClassification"
+          },
+          "MarkNormal": {
+            "Type": "Pass",
+            "Result": {
+              "label": "normal",
+              "severity": "INFO"
+            },
+            "ResultPath": "$.classification",
+            "Next": "RouteByClassification"
+          },
+          "RouteByClassification": {
+            "Type": "Choice",
+            "Comment": "Dirige la línea a SecurityAlerts si es sospechosa, a Logs si es normal",
+            "Choices": [
+              {
+                "Variable": "$.classification.label",
+                "StringEquals": "suspicious",
                 "Next": "WriteSecurityAlert"
               }
             ],
@@ -62,8 +100,14 @@
                 "event_type": {
                   "S.$": "$.event_type"
                 },
+                "severity": {
+                  "S.$": "$.classification.severity"
+                },
                 "ingested_at": {
                   "S.$": "$.ingested_at"
+                },
+                "last_modified": {
+                  "S.$": "$.last_modified"
                 },
                 "hostname": {
                   "S.$": "$.hostname"
@@ -89,12 +133,14 @@
               {
                 "ErrorEquals": [
                   "DynamoDB.ProvisionedThroughputExceededException",
-                  "ProvisionedThroughputExceededException",
+                  "DynamoDB.ThrottlingException",
+                  "DynamoDB.RequestLimitExceededException",
                   "DynamoDB.AmazonDynamoDBException"
                 ],
                 "IntervalSeconds": 1,
-                "MaxAttempts": 3,
-                "BackoffRate": 2.0
+                "MaxAttempts": 5,
+                "BackoffRate": 2.0,
+                "JitterStrategy": "FULL"
               }
             ],
             "End": true
@@ -110,6 +156,12 @@
                 },
                 "sk": {
                   "S.$": "$.sk"
+                },
+                "gsi_pk": {
+                  "S": "LOG"
+                },
+                "last_modified": {
+                  "S.$": "$.last_modified"
                 },
                 "event_type": {
                   "S.$": "$.event_type"
@@ -141,12 +193,14 @@
               {
                 "ErrorEquals": [
                   "DynamoDB.ProvisionedThroughputExceededException",
-                  "ProvisionedThroughputExceededException",
+                  "DynamoDB.ThrottlingException",
+                  "DynamoDB.RequestLimitExceededException",
                   "DynamoDB.AmazonDynamoDBException"
                 ],
                 "IntervalSeconds": 1,
-                "MaxAttempts": 3,
-                "BackoffRate": 2.0
+                "MaxAttempts": 5,
+                "BackoffRate": 2.0,
+                "JitterStrategy": "FULL"
               }
             ],
             "End": true

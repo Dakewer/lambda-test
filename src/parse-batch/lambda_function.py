@@ -7,6 +7,9 @@ y regresa un arreglo de objetos listos para que Step Functions los procese.
 
 No escribe a DynamoDB; esa responsabilidad queda delegada a la máquina
 de estados de Step Functions.
+
+Cada item lleva `last_modified`: el LastModified del objeto en S3 (la hora
+real en que llegó el batch), que es el sort key del GSI de la tabla Logs.
 """
 import os
 import re
@@ -42,7 +45,7 @@ def classify(message: str) -> str:
     return "other"
 
 
-def build_item(line: str, batch_id: str, line_no: int, ingested_at: str) -> dict | None:
+def build_item(line: str, batch_id: str, line_no: int, ingested_at: str, last_modified: str) -> dict | None:
     """Parsea una línea de syslog y construye el objeto de datos del evento."""
     match = LOG_PATTERN.match(line)
     if not match:
@@ -54,6 +57,7 @@ def build_item(line: str, batch_id: str, line_no: int, ingested_at: str) -> dict
     item["sk"] = f"{batch_id}#{line_no:05d}"
     item["event_type"] = classify(item["message"])
     item["ingested_at"] = ingested_at
+    item["last_modified"] = last_modified
     item["batch_id"] = batch_id
     item["line_no"] = line_no
 
@@ -96,6 +100,7 @@ def lambda_handler(event, context):
 
     print(f"Descargando s3://{bucket}/{key}")
     response = s3.get_object(Bucket=bucket, Key=key)
+    last_modified = response["LastModified"].astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     content = response["Body"].read().decode("utf-8")
     lines = content.splitlines()
 
@@ -104,7 +109,7 @@ def lambda_handler(event, context):
         line = line.strip()
         if not line:
             continue
-        item = build_item(line, batch_id, line_no, ingested_at)
+        item = build_item(line, batch_id, line_no, ingested_at, last_modified)
         if item:
             items.append(item)
 
