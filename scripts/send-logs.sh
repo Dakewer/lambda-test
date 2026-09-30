@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # send-logs.sh — uploads every batch produced by split-log.sh to
-# s3://<bucket>/input/, sleeping N seconds between each upload so the
-# Lambda trigger fires once per batch, simulating logs arriving over time.
+# s3://<bucket>/input/, sleeping N seconds between each upload so each
+# batch triggers its own Step Functions execution, simulating logs arriving
+# over time. ./scripts/start_logging.sh runs split-log.sh + this in one go.
 #
 # Usage:
 #   ./scripts/send-logs.sh <seconds_between_uploads> [batches_dir] [bucket_name]
@@ -16,9 +17,12 @@ if [ $# -lt 1 ]; then
   exit 1
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/config.sh"
+
 WAIT_SECONDS="$1"
 BATCHES_DIR="${2:-batches}"
-BUCKET_NAME="${3:-${BUCKET_NAME:-logging-bucket-1321}}"
+BUCKET_NAME="${3:-${BUCKET_NAME}}"
 
 shopt -s nullglob
 FILES=("${BATCHES_DIR}"/openssh-*.log)
@@ -33,8 +37,8 @@ echo "Uploading ${#FILES[@]} batches to s3://${BUCKET_NAME}/input/ (${WAIT_SECON
 
 for i in "${!FILES[@]}"; do
   f="${FILES[$i]}"
-  echo "[$((i + 1))/${#FILES[@]}] Uploading $(basename "$f")..."
-  aws s3 cp "$f" "s3://${BUCKET_NAME}/input/$(basename "$f")"
+  echo "[$((i + 1))/${#FILES[@]}] $(date +%H:%M:%S) Uploading $(basename "$f") ($(wc -c < "$f") bytes)..."
+  aws s3 cp "$f" "s3://${BUCKET_NAME}/input/$(basename "$f")" --only-show-errors
 
   if [ $((i + 1)) -lt ${#FILES[@]} ]; then
     sleep "${WAIT_SECONDS}"

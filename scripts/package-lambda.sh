@@ -9,7 +9,7 @@
 #
 # Config (env vars, all optional):
 #   FUNCTION_NAME     (default: log-processing)
-#   BUCKET_NAME       (default: logging-bucket-1321)
+#   BUCKET_NAME       (default: logging-bucket-<account_id>, ver config.sh)
 #   TABLE_NAME        (default: log-events) — la tabla creada por
 #                      ./scripts/create-dynamodb-table.sh
 #   ROLE_NAME         (default: log-processing-lambda-role)
@@ -22,7 +22,6 @@
 set -euo pipefail
 
 FUNCTION_NAME="${FUNCTION_NAME:-log-processing}"
-BUCKET_NAME="${BUCKET_NAME:-logging-bucket-1321}"
 TABLE_NAME="${TABLE_NAME:-log-events}"
 ROLE_NAME="${ROLE_NAME:-log-processing-lambda-role}"
 FALLBACK_ROLE_NAME="${FALLBACK_ROLE_NAME:-LabRole}"
@@ -32,6 +31,7 @@ TIMEOUT=30
 MEMORY=128
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/config.sh"
 SRC_DIR="${SCRIPT_DIR}/../src/logging-system"
 BUILD_DIR="${SCRIPT_DIR}/../build"
 ZIP_FILE="${BUILD_DIR}/lambda.zip"
@@ -52,7 +52,6 @@ fi
 (cd "${BUILD_DIR}/pkg" && zip -rq "${ZIP_FILE}" .)
 echo "Created ${ZIP_FILE} ($(du -h "${ZIP_FILE}" | cut -f1))"
 
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 
 echo "== Ensuring IAM role =="
 ROLE_CREATED_BY_SCRIPT="false"

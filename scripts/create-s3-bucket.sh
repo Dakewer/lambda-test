@@ -1,26 +1,27 @@
 #!/usr/bin/env bash
-# create-s3-bucket.sh — creates the "logging" S3 bucket (bucket names are
-# globally unique in AWS, override with BUCKET_NAME or a first argument if
-# "logging" is already taken) with el prefijo input/, blocking public
-# access. Ya no hay prefijo output/: la Lambda escribe a DynamoDB.
+# create-s3-bucket.sh — crea el bucket de logs (default
+# logging-bucket-<account_id>, ver config.sh) con el prefijo input/,
+# bloqueando el acceso público.
 #
 # Usage:
 #   ./scripts/create-s3-bucket.sh [bucket_name]
 set -euo pipefail
 
-BUCKET_NAME="${1:-${BUCKET_NAME:-logging-bucket-1321}}"
-REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/config.sh"
 
-echo "Creating bucket '${BUCKET_NAME}' in region '${REGION}'..."
+BUCKET_NAME="${1:-${BUCKET_NAME}}"
+
+echo "Creating bucket '${BUCKET_NAME}' in region '${AWS_REGION}'..."
 
 if aws s3api head-bucket --bucket "${BUCKET_NAME}" 2>/dev/null; then
   echo "Bucket '${BUCKET_NAME}' already exists, skipping creation."
 else
-  if [ "${REGION}" = "us-east-1" ]; then
-    aws s3api create-bucket --bucket "${BUCKET_NAME}" --region "${REGION}"
+  if [ "${AWS_REGION}" = "us-east-1" ]; then
+    aws s3api create-bucket --bucket "${BUCKET_NAME}" --region "${AWS_REGION}" >/dev/null
   else
-    aws s3api create-bucket --bucket "${BUCKET_NAME}" --region "${REGION}" \
-      --create-bucket-configuration LocationConstraint="${REGION}"
+    aws s3api create-bucket --bucket "${BUCKET_NAME}" --region "${AWS_REGION}" \
+      --create-bucket-configuration LocationConstraint="${AWS_REGION}" >/dev/null
   fi
 
   aws s3api put-public-access-block --bucket "${BUCKET_NAME}" \

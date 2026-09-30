@@ -27,24 +27,14 @@
 #   ./scripts/deploy-state-machine.sh
 set -euo pipefail
 
-LAMBDA_FUNCTION_NAME="${LAMBDA_FUNCTION_NAME:-parse-batch}"
-STATE_MACHINE_NAME="${STATE_MACHINE_NAME:-log-processing-state-machine}"
-BUCKET_NAME="${BUCKET_NAME:-logging-bucket-1321}"
-LOGS_TABLE_NAME="${LOGS_TABLE_NAME:-Logs}"
-SECURITY_ALERTS_TABLE_NAME="${SECURITY_ALERTS_TABLE_NAME:-SecurityAlerts}"
-
-LAMBDA_ROLE_NAME="${LAMBDA_ROLE_NAME:-parse-batch-lambda-role}"
-SFN_ROLE_NAME="${SFN_ROLE_NAME:-step-functions-log-processing-role}"
-EB_RULE_NAME="${EB_RULE_NAME:-s3-log-processing-rule}"
-EB_ROLE_NAME="${EB_ROLE_NAME:-eventbridge-step-functions-role}"
-FALLBACK_ROLE_NAME="${FALLBACK_ROLE_NAME:-LabRole}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/config.sh"
 
 RUNTIME="python3.12"
 HANDLER="lambda_function.lambda_handler"
 TIMEOUT=30
 MEMORY=128
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${SCRIPT_DIR}/.."
 SRC_DIR="${ROOT_DIR}/src/parse-batch"
 BUILD_DIR="${ROOT_DIR}/build"
@@ -53,9 +43,6 @@ ZIP_FILE="${BUILD_DIR}/parse-batch.zip"
 
 mkdir -p "${BUILD_DIR}"
 
-echo "== Verificando identidad de AWS =="
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-AWS_REGION="${AWS_REGION:-$(aws configure get region 2>/dev/null || echo "us-east-1")}"
 echo "Cuenta: ${ACCOUNT_ID}, Región: ${AWS_REGION}"
 
 # -----------------------------------------------------------------------------
@@ -314,7 +301,7 @@ aws events put-rule \
         \"name\": [\"${BUCKET_NAME}\"]
       },
       \"object\": {
-        \"key\": [{\"prefix\": \"input/\"}]
+        \"key\": [{\"wildcard\": \"input/*.log\"}]
       }
     }
   }" \
