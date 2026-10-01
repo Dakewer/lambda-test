@@ -1,82 +1,92 @@
-# Log processing system
+# Logging System (Práctica 2)
 
-Sistema serverless que recibe logs en batches (~1KB), los procesa con una
-AWS Lambda y guarda cada línea como un item en DynamoDB.
+Sistema serverless que ingiere logs de servidores, los clasifica como
+**normales** o **sospechosos** y expone los resultados mediante un HTTP API.
+
+1. `start_logging.sh` parte el log de OpenSSH en batches de ~1KB y sube uno a
+   S3 cada N segundos.
+2. Cada batch que llega a `s3://<bucket>/input/*.log` dispara (vía EventBridge)
+   una ejecución de Step Functions.
+3. La Lambda `parse-batch` descarga el batch y lo separa en líneas.
+4. Un estado **Map** recorre las líneas; dentro, un **Choice** clasifica cada
+   una (sospechosa si contiene `Invalid user` o `POSSIBLE BREAK-IN ATTEMPT`) y
+   otro **Choice** la dirige a `SecurityAlerts` o `Logs`. Las escrituras a
+   DynamoDB tienen **Retry** con backoff exponencial para throttling.
+5. API Gateway (HTTP API) expone `GET /alerts` y `GET /logs?top=N`, cada uno
+   con su propia Lambda.
+
+## Arquitectura
 
 ```mermaid
 flowchart LR
-    S3["s3://logging/input"] --> Lambda["Log processing"]
-    Lambda --> DDB[("DynamoDB<br/>log-events")]
-```
+    Script["start_logging.sh N"] -->|batch ~1KB cada N s| S3[("S3<br/>input/*.log")]
+    S3 -->|Object Created| EB["EventBridge rule"]
+    EB -->|bucket + key| SFN
 
-1. Un batch (`.log`) se sube a `s3://logging/input/`.
-2. Esa escritura dispara la Lambda `log-processing` vía un S3 event trigger.
-3. La Lambda descarga el batch, parsea cada línea y la clasifica por
-   `event_type` (`invalid_user`, `failed_password`, `break_in_attempt`...).
-4. Escribe un item por línea en la tabla `log-events` con `BatchWriteItem`.
+    subgraph SFN["Step Functions: log-processing-state-machine"]
+        PB["ParseBatch<br/>(Lambda parse-batch)"] --> Map
+        subgraph Map["Map: ProcessLogLines (una iteración por línea)"]
+            C1{"ClassifyLine"} -->|BREAK-IN ATTEMPT| H["MarkBreakInAttempt<br/>severity HIGH"]
+            C1 -->|Invalid user| M["MarkInvalidUser<br/>severity MEDIUM"]
+            C1 -->|default| N["MarkNormal"]
+            H & M & N --> C2{"RouteByClassification"}
+            C2 -->|suspicious| WS["WriteSecurityAlert<br/>(putItem + Retry)"]
+            C2 -->|normal| WL["WriteLog<br/>(putItem + Retry)"]
+        end
+    end
 
-En la parte 1 la Lambda generaba un CSV y lo subía a `s3://logging/output/`;
-ahora escribe directo a DynamoDB, así que ya no existe el prefijo `output/`.
+    WS --> SA[("DynamoDB<br/>SecurityAlerts")]
+    WL --> LG[("DynamoDB<br/>Logs<br/>GSI last_modified-index")]
 
-## Dataset
-
-Se usa el log de ejemplo de OpenSSH de [loghub](https://github.com/logpai/loghub/blob/master/OpenSSH/OpenSSH_2k.log)
-(formato syslog):
-
-```
-Dec 10 06:55:46 LabSZ sshd[24200]: reverse mapping checking getaddrinfo for ns.marryaldkfaczcz.com [173.234.31.186] failed - POSSIBLE BREAK-IN ATTEMPT!
-Dec 10 06:55:46 LabSZ sshd[24200]: Invalid user webmaster from 173.234.31.186
-Dec 10 06:55:46 LabSZ sshd[24200]: input_userauth_request: invalid user webmaster [preauth]
+    Client["Cliente / curl"] --> API["API Gateway (HTTP API)"]
+    API -->|GET /alerts| LA["Lambda get-alerts"] -->|Scan| SA
+    API -->|GET /logs?top=N| LL["Lambda get-logs"] -->|Query GSI| LG
 ```
 
 ## Estructura del proyecto
 
 ```
-├── README.md
+├── OpenSSH_2k.log                   # log de ejemplo (se descarga solo si no existe)
 ├── scripts
-│   ├── create-s3-bucket.sh       # crea el bucket "logging" con el prefijo input/
-│   ├── create-dynamodb-table.sh  # crea las tablas DynamoDB "Logs" y "SecurityAlerts" (y soporte para log-events)
-│   ├── deploy-state-machine.sh   # Parte 3: empaqueta Lambda parse-batch, despliega State Machine y regla EventBridge
-│   ├── package-lambda.sh         # Parte 2: empaqueta + despliega Lambda monolítica y trigger directo S3 (referencia)
-│   ├── split-log.sh              # descarga el log y lo parte en batches de ~1KB: openssh-<timestamp>.log
-│   ├── send-logs.sh              # sube los batches a s3://logging/input/ cada N segundos
-│   └── teardown.sh               # elimina todo lo creado (Step Functions, EventBridge, Lambdas, tablas, bucket)
+│   ├── config.sh                    # nombres y defaults compartidos (lo cargan todos los scripts)
+│   ├── deploy.sh                    # crea TODA la infraestructura (corre los 4 siguientes en orden)
+│   ├── create-s3-bucket.sh          #   bucket S3 con prefijo input/
+│   ├── create-dynamodb-table.sh     #   tablas Logs (con GSI last_modified-index) y SecurityAlerts
+│   ├── deploy-state-machine.sh      #   Lambda parse-batch, Step Functions, regla EventBridge
+│   ├── deploy-api.sh                #   Lambdas get-alerts / get-logs y HTTP API
+│   ├── start_logging.sh             # parte el log en batches y los sube cada N segundos
+│   ├── split-log.sh                 #   parte el log en batches de ~1KB (batches/openssh-<ts>.log)
+│   ├── send-logs.sh                 #   sube los batches a S3 cada N segundos
+│   ├── teardown.sh                  # elimina todo y verifica que no quede nada
+│   └── package-lambda.sh            # Parte 2 (referencia histórica, ya no se usa)
 └── src
-    ├── logging-system            # Parte 2: Lambda monolítica anterior (referencia histórica)
-    │   ├── lambda_function.py
-    │   └── requirements.txt
-    ├── parse-batch               # Parte 3: Lambda enfocada exclusivamente en parsear el batch
-    │   ├── lambda_function.py
-    │   └── requirements.txt
-    └── step-functions            # Parte 3: Definición ASL de la State Machine
-        └── state-machine.asl.json
+    ├── parse-batch/                 # Lambda: descarga el batch y lo separa en líneas
+    ├── get-alerts/                  # Lambda: GET /alerts
+    ├── get-logs/                    # Lambda: GET /logs?top=N
+    ├── step-functions/
+    │   └── state-machine.asl.json   # definición ASL de la state machine
+    └── logging-system/              # Parte 2 (referencia histórica, ya no se usa)
 ```
 
 ## Requisitos previos
 
-- AWS CLI v2 configurado (`aws configure`) con credenciales que puedan crear
-  buckets S3, tablas DynamoDB y funciones Lambda.
-- `python3`, `pip3` y `zip` instalados localmente (para empaquetar la Lambda).
-- `curl` (usado por `split-log.sh` para descargar el log de ejemplo si no
-  existe localmente).
+- AWS CLI v2 configurado (`aws configure`) con permisos para S3, DynamoDB,
+  Lambda, Step Functions, EventBridge, API Gateway e IAM.
+- `bash`, `zip` y `curl`.
 
-El nombre de bucket `logging-bucket-1321` es solo el default; como los
-nombres de bucket en S3 son únicos globalmente, si ya está tomado exporta
-`BUCKET_NAME=tu-nombre-unico` antes de correr los scripts (todos lo
-respetan) y úsalo en todos los pasos. Lo mismo con `TABLE_NAME` (default
-`log-events`), que `package-lambda.sh` le pasa a la Lambda como variable de
-entorno.
+Los scripts crean sus propios roles IAM. En cuentas donde no se permite
+`iam:CreateRole` (AWS Academy) usan automáticamente el rol existente
+`LabRole`, y `teardown.sh` nunca borra un rol que no haya creado él mismo.
 
-`package-lambda.sh` crea su propio rol IAM (`log-processing-lambda-role`)
-con permisos de lectura sobre `input/*` y de escritura en la tabla. En
-cuentas restringidas donde no se permite `iam:CreateRole` (p. ej. AWS
-Academy) usa automáticamente el rol existente `LabRole`, y `teardown.sh`
-nunca borra un rol que no haya creado él mismo.
+### Nombres de los recursos
 
-El trigger es una notificación S3 -> Lambda directa. Si falla al
-configurarse desde la CLI, el script sigue e imprime el error para poder
-crearla a mano: Bucket > Properties > Event notifications, prefijo
-`input/`, sufijo `.log`, destino la función `log-processing`.
+Todos los nombres viven en [scripts/config.sh](scripts/config.sh) y se pueden
+sobrescribir con variables de entorno. El único que tiene que ser único en
+todo AWS es el bucket de S3, así que su nombre default lleva el account id:
+`logging-bucket-<account_id>`. Así cada integrante puede desplegar en su
+propia cuenta sin chocar con los demás. Los otros recursos (tablas, Lambdas,
+state machine, roles, API) solo tienen que ser únicos dentro de una cuenta, así
+que conservan nombres fijos (`Logs`, `SecurityAlerts`, `parse-batch`...).
 
 ### Desde WSL
 
@@ -86,7 +96,7 @@ en esa ruta el bit de ejecución no siempre persiste (con
 
 ```bash
 cd "/mnt/c/Users/<usuario>/Downloads/Desarrollo en la nube/lambda-test"
-bash scripts/create-s3-bucket.sh
+bash scripts/deploy.sh
 ```
 
 Dos cosas que muerden:
@@ -99,193 +109,175 @@ Dos cosas que muerden:
   Learner Lab (`aws_access_key_id`, `aws_secret_access_key` y
   `aws_session_token`), que expiran en cada sesión.
 
-## Parte 3: Step Functions
+## Uso
 
-En esta fase, la arquitectura evoluciona hacia una solución serverless desacoplada y orientada a eventos mediante **AWS Step Functions** y **Amazon EventBridge**.
+### 1. Crear la infraestructura
 
-> **Nota importante:**
-> Este flujo basado en Step Functions **reemplaza por completo el trigger directo S3 -> Lambda de la parte 2**.
-> Los scripts y código de la parte 2 (`scripts/package-lambda.sh` y `src/logging-system/`) se conservan exclusivamente como **referencia histórica de la evolución arquitectónica**, pero ya no se utilizan en producción una vez desplegado Step Functions.
-
-### Diagrama del flujo
-
-```mermaid
-flowchart TD
-    S3["S3 Bucket: s3://logging-bucket-1321/input/*.log<br/>(EventBridge Notifications)"] -->|aws.s3: Object Created| EBR["EventBridge Rule<br/>s3-log-processing-rule"]
-    EBR -->|InputTransformer: bucket + key| SFN["Step Functions State Machine<br/>log-processing-state-machine"]
-
-    subgraph SFN_Workflow["State Machine: log-processing-state-machine"]
-        SFN --> PB["Task: ParseBatch<br/>(Lambda parse-batch)"]
-        PB -->|Arreglo de eventos parseados| Map["Map State: ProcessLogLines<br/>(Modo Inline)"]
-
-        subgraph MapProcessor["ItemProcessor (Iteración por línea de log)"]
-            Map --> Choice{"Choice: ClassifyLog<br/>¿Mensaje sospechoso?<br/>(Invalid user / Break-in attempt)"}
-            Choice -->|Sospechoso| WriteSec["Task: WriteSecurityAlert<br/>arn:aws:states:::dynamodb:putItem"]
-            Choice -->|Normal / Default| WriteLog["Task: WriteLog<br/>arn:aws:states:::dynamodb:putItem"]
-        end
-    end
-
-    WriteSec -->|PutItem directo| SecTable[("DynamoDB Table<br/>SecurityAlerts")]
-    WriteLog -->|PutItem directo| LogsTable[("DynamoDB Table<br/>Logs")]
-```
-
-### ¿Por qué se separó `parse_batch` de la clasificación y escritura?
-
-1. **Separación de responsabilidades (Single Responsibility Principle):**
-   En la arquitectura anterior, una única Lambda monolítica descargaba el archivo, aplicaba expresiones regulares, evaluaba reglas de clasificación y realizaba llamadas de red a DynamoDB. Al separar `parse-batch`, la función Lambda se enfoca exclusivamente en descargar el archivo desde S3 y descomponer el texto en registros estructurados con regex. Toda la lógica de control de flujo, branching condicional y orquestación se delega al motor declarativo de Step Functions.
-2. **Integraciones directas de Step Functions a DynamoDB (SDK Integrations sin código):**
-   Step Functions se conecta directamente a DynamoDB mediante `arn:aws:states:::dynamodb:putItem`. Esto elimina la necesidad de código intermedio (*glue code*) en Python, reduce la superficie de bugs, evita reservar memoria y CPU en funciones Lambda para esperar I/O de red de base de datos, y disminuye los costos operativos de cómputo.
-3. **Resiliencia declarativa y manejo de retries para throttling:**
-   Cuando múltiples batches se procesan concurrentemente, pueden generarse ráfagas de escritura que excedan la capacidad o provoquen `ProvisionedThroughputExceededException` o `DynamoDB.AmazonDynamoDBException`. La máquina de estados gestiona reintentos exponenciales automáticos de forma nativa (`IntervalSeconds: 1`, `BackoffRate: 2.0`, `MaxAttempts: 3`), protegiendo el sistema contra pérdida de datos sin ensuciar la lógica de negocio con bucles de reintento manuales.
-4. **Aislamiento físico y seguridad (Defense in Depth):**
-   Separar los eventos anómalos o sospechosos (`*Invalid user*`, `*POSSIBLE BREAK-IN ATTEMPT*`) en una tabla dedicada `SecurityAlerts` aislada de `Logs` permite:
-   - Auditar eventos críticos de seguridad con latencias mínimas y sin la sobrecarga de consultar millones de logs rutinarios.
-   - Definir políticas de acceso IAM más estrictas sobre la tabla de seguridad.
-   - Habilitar alarmas específicas o flujos de respuesta ante incidentes (por ejemplo, triggers secundarios hacia SNS o SIEM) únicamente sobre `SecurityAlerts`.
-   - Establecer políticas de retención (TTL) diferenciadas para cada categoría de log.
-
-### Instrucciones de uso paso a paso
-
-#### 1. Crear las tablas DynamoDB (`Logs` y `SecurityAlerts`)
-Crea ambas tablas en modo bajo demanda (`PAY_PER_REQUEST`) con sus índices secundarios globales (`event_type-index`):
 ```bash
-./scripts/create-dynamodb-table.sh
+./scripts/deploy.sh
 ```
-*(Opcional: puedes personalizar los nombres definiendo `LOGS_TABLE_NAME` y `SECURITY_ALERTS_TABLE_NAME`)*.
 
-#### 2. Desplegar la State Machine y componentes serverless
-Ejecuta el script de despliegue automatizado:
+Crea el bucket, las dos tablas, la Lambda `parse-batch`, la state machine, la
+regla de EventBridge, las Lambdas `get-alerts` / `get-logs` y el HTTP API. Al
+final imprime la URL del API (también queda en `build/api-endpoint.txt`). Es
+idempotente: correrlo otra vez actualiza lo que ya existe.
+
+### 2. Enviar logs
+
 ```bash
-./scripts/deploy-state-machine.sh
+./scripts/start_logging.sh 30   # un batch cada 30 segundos
 ```
-Este script realiza de forma idéntica y reproducible:
-- El empaquetado y despliegue de la función Lambda `parse-batch`.
-- La creación de los roles IAM requeridos (o conmutación automática a `LabRole` en entornos restringidos como AWS Academy).
-- La creación o actualización de la State Machine `log-processing-state-machine` en Step Functions (inyectando ARNs y nombres de tabla en la definición ASL).
-- La activación de notificaciones EventBridge en el bucket S3 (`put-bucket-notification-configuration`).
-- La creación de la regla EventBridge `s3-log-processing-rule` con su target hacia la State Machine y transformación de parámetros (`InputTransformer`).
 
-#### 3. Enviar logs hacia S3
-Si no tienes los batches descargados y divididos, généralos primero:
+Cada subida dispara una ejecución de Step Functions.
+
+> **Espera ~5 minutos después de `deploy.sh`.** En un bucket recién creado,
+> S3 tarda unos minutos en empezar a mandar eventos a EventBridge (lo medimos:
+> más de 4 minutos). Los batches que se suban antes llegan a S3 pero no
+> disparan la state machine. Si pasa, basta con volver a subirlos.
+
+**Tamaño de batch:** 1KB (1024 bytes). `split-log.sh` agrega líneas completas
+hasta alcanzar o pasar 1024 bytes y entonces cierra el batch, así que cada
+archivo mide entre 1024 y ~1190 bytes (8 a 12 líneas; el último batch es
+más chico) y ninguna línea queda partida entre dos batches. Con
+`OpenSSH_2k.log` salen 213 batches.
+
+### 3. Consultar el API
+
 ```bash
-./scripts/split-log.sh
+API=$(cat build/api-endpoint.txt)
+curl "$API/alerts"
+curl "$API/logs?top=5"
 ```
-Luego inicia la subida periódica de batches al prefijo `input/` de S3:
-```bash
-# Sube un batch cada 60 segundos
-./scripts/send-logs.sh 60
+
+`GET /alerts` regresa todas las alertas de `SecurityAlerts`, las más
+recientes primero:
+
+```json
+{
+  "count": 2,
+  "alerts": [
+    {"id": "openssh-1790032937#00002", "timestamp": "Dec 10 06:55:46", "host": "LabSZ",
+     "log": "Invalid user webmaster from 173.234.31.186", "severity": "MEDIUM"},
+    {"id": "openssh-1790032937#00001", "timestamp": "Dec 10 06:55:46", "host": "LabSZ",
+     "log": "reverse mapping checking getaddrinfo for ns.marryaldkfaczcz.com [173.234.31.186] failed - POSSIBLE BREAK-IN ATTEMPT!",
+     "severity": "HIGH"}
+  ]
+}
 ```
-Cada subida emitirá un evento en EventBridge que iniciará automáticamente una nueva ejecución en Step Functions.
 
-#### 4. Revisar ejecuciones en Step Functions Console (Graph View)
-1. En la consola de AWS, navega a **Step Functions** > **State machines** y haz clic en **`log-processing-state-machine`**.
-2. En la pestaña **Executions**, selecciona la ejecución más reciente en la lista.
-3. En la sección **Graph view**, observa el flujo visual:
-   - El estado de tarea `ParseBatch` en verde, que extrae y entrega el arreglo de líneas a `ProcessLogLines`.
-   - Haz clic sobre el estado `Map` (`ProcessLogLines`) para inspeccionar las ejecuciones concurrentes de cada registro del batch.
-   - En el subflujo, visualiza cómo el estado `Choice` (`ClassifyLog`) bifurca cada ítem: los registros con intentos de intrusión o usuarios inválidos fluyen a `WriteSecurityAlert`, mientras que los logs normales fluyen a `WriteLog`.
-4. En la pestaña **Execution input and output**, puedes validar el payload estructurado provisto por EventBridge (`{"bucket": "...", "key": "..."}`) y la salida del proceso.
+| severity | Cuándo                                    |
+| -------- | ----------------------------------------- |
+| `HIGH`   | La línea contiene `POSSIBLE BREAK-IN ATTEMPT` |
+| `MEDIUM` | La línea contiene `Invalid user`          |
 
-#### 5. Consultar y verificar ambas tablas en DynamoDB Console
-En la consola de AWS, navega a **DynamoDB** > **Tables**:
-- **Tabla `SecurityAlerts`:**
-  1. Selecciona **`SecurityAlerts`** > pestaña **Explore table items**.
-  2. Verifica que solo contiene eventos clasificados como sospechosos (`break_in_attempt`, `invalid_user`).
-  3. Cambia la opción a **Query**, selecciona el índice **`event_type-index`** y consulta con `event_type = break_in_attempt` para auditar intentos de intrusión ordenados temporalmente.
-- **Tabla `Logs`:**
-  1. Selecciona **`Logs`** > pestaña **Explore table items**.
-  2. Comprueba que contiene los logs ordinarios (desconexiones, actividad de sshd regular, etc.).
-  3. Realiza una **Query** en la tabla con la partition key `pk = LabSZ#sshd` y en la sort key `sk` la condición **Begins with** `openssh-` para ver todos los logs de un host o batch en particular.
+`GET /logs?top=N` regresa los últimos `N` logs de `Logs` (default 10, máximo
+1000). No hace Scan: es un `Query` al GSI `last_modified-index` con
+`Limit=N` y `ScanIndexForward=false`.
 
-#### 6. Limpieza de recursos (Teardown)
-Cuando finalices la práctica o quieras limpiar la cuenta, ejecuta:
+```json
+{
+  "top": 5, "count": 5,
+  "logs": [
+    {"id": "openssh-1790032940#00004", "timestamp": "Dec 10 07:02:47", "host": "LabSZ",
+     "log": "Received disconnect from 173.234.31.186: 11: Bye Bye [preauth]",
+     "event_type": "disconnect", "last_modified": "2026-09-29T18:31:05Z"}
+  ]
+}
+```
+
+### 4. Ver el flujo en la consola de AWS
+
+- **S3** > `logging-bucket-<account_id>` > `input/`: aparece un `.log` nuevo
+  cada N segundos.
+- **Step Functions** > `log-processing-state-machine` > **Executions** > la
+  más reciente > **Graph view**: `ParseBatch` → `ProcessLogLines` (Map). Al
+  seleccionar una iteración del Map se ve si pasó por `MarkBreakInAttempt`,
+  `MarkInvalidUser` o `MarkNormal` y a qué tabla escribió.
+- **DynamoDB** > `SecurityAlerts` / `Logs` > **Explore table items**: el
+  número de items crece con cada batch. En `Logs` se puede hacer **Query**
+  sobre el índice `last_modified-index` con `gsi_pk = LOG` y orden
+  descendente, que es lo mismo que hace `GET /logs`.
+- **API Gateway** > `logging-api` > **Routes**: `GET /alerts` y `GET /logs`,
+  cada una con su integración Lambda.
+
+### 5. Eliminar los recursos
+
 ```bash
 ./scripts/teardown.sh
 ```
-Este script elimina de manera segura:
-- La regla EventBridge `s3-log-processing-rule` y su target `StepFunctionsTarget`.
-- La State Machine `log-processing-state-machine` en Step Functions.
-- Las funciones Lambda `parse-batch` y `log-processing`.
-- Los roles IAM creados específicamente por el proyecto (verificados mediante marcadores en `build/`).
-- Las tablas DynamoDB `Logs`, `SecurityAlerts` y `log-events`.
-- El contenido del bucket S3 y el bucket en sí.
-- Los artefactos temporales en `build/`.
 
----
+Elimina el HTTP API, la regla de EventBridge, la state machine, las Lambdas
+(y sus log groups de CloudWatch), los roles IAM que haya creado el proyecto,
+las tablas, el bucket con su contenido y `build/`. Al final consulta cada
+recurso y confirma que ya no existe:
 
-## Parte 2 (Referencia histórica): Flujo S3 -> Lambda -> DynamoDB
-
-> Esta sección documenta la arquitectura anterior de la Parte 2. Para el flujo de producción actual, consulta la [Parte 3: Step Functions](#parte-3-step-functions).
-
-### Uso (Parte 2)
-
-```bash
-# 1. Crear el bucket S3 con el prefijo input/
-./scripts/create-s3-bucket.sh
-
-# 2. Crear la tabla DynamoDB "log-events"
-./scripts/create-dynamodb-table.sh
-
-# 3. Partir el log de OpenSSH en batches de ~1KB -> ./batches/openssh-<timestamp>.log
-./scripts/split-log.sh
-
-# 4. Empaquetar y desplegar la Lambda (rol IAM, función y trigger S3)
-./scripts/package-lambda.sh
-
-# 5. Enviar los batches a s3://logging/input/, uno cada 60 segundos
-./scripts/send-logs.sh 60
-
-# 6. (Opcional) eliminar todos los recursos creados
-./scripts/teardown.sh
 ```
+== Verificación ==
+  [ok] Bucket s3://logging-bucket-123456789012 eliminado
+  [ok] Tabla DynamoDB Logs eliminado
+  ...
+Teardown completado: todos los recursos fueron eliminados.
+```
+
+**Limpieza manual** (si no se puede correr el script): en la consola borrar,
+en este orden, el API `logging-api` (API Gateway), la regla
+`s3-log-processing-rule` (EventBridge), la state machine
+`log-processing-state-machine`, las Lambdas `parse-batch`, `get-alerts` y
+`get-logs`, las tablas `Logs` y `SecurityAlerts`, y finalmente vaciar y borrar
+el bucket `logging-bucket-<account_id>`.
 
 ## Modelo de datos
 
-Las tablas `Logs` y `SecurityAlerts` de la Parte 3 (al igual que la tabla `log-events` de la Parte 2) comparten la misma estructura de datos, un item por línea de log:
+Un item por línea de log. Ambas tablas comparten el esquema base:
 
-| Atributo           | Ejemplo                       | Notas                                 |
-| ------------------ | ----------------------------- | ------------------------------------- |
-| `pk`               | `LabSZ#sshd`                  | Partition key: `<hostname>#<program>` |
-| `sk`               | `openssh-1789440570#00007`    | Sort key: `<batch_id>#<línea>`        |
-| `event_type`       | `invalid_user`                | Partition key del GSI                 |
-| `ingested_at`      | `2026-09-21T18:04:11Z`        | Sort key del GSI                      |
-| `src_ip`           | `173.234.31.186`              | Solo si la línea trae IP              |
-| `syslog_timestamp` | `Dec 10 06:55:46`             | La hora que trae el log               |
-| `hostname`         | `LabSZ`                       |                                       |
-| `program`          | `sshd`                        |                                       |
-| `message`          | `Invalid user webmaster from…`| El mensaje sin la metadata syslog     |
+| Atributo           | Ejemplo                        | Notas                                         |
+| ------------------ | ------------------------------ | --------------------------------------------- |
+| `pk`               | `LabSZ#sshd`                   | Partition key: `<hostname>#<program>`         |
+| `sk`               | `openssh-1790032937#00007`     | Sort key: `<batch_id>#<línea>` (es el `id` del API) |
+| `event_type`       | `invalid_user`                 | Partition key del GSI `event_type-index`      |
+| `ingested_at`      | `2026-09-29T18:31:06Z`         | Hora en que se procesó; sort key de `event_type-index` |
+| `last_modified`    | `2026-09-29T18:31:05Z`         | `LastModified` del batch en S3 (hora real de llegada) |
+| `syslog_timestamp` | `Dec 10 06:55:46`              | La hora que trae el log                       |
+| `hostname`         | `LabSZ`                        |                                               |
+| `program` / `pid`  | `sshd` / `24200`               |                                               |
+| `src_ip`           | `173.234.31.186`               | Vacío si la línea no trae IP                  |
+| `message`          | `Invalid user webmaster from…` | El mensaje sin la metadata syslog             |
 
-La `sk` es determinista (batch + número de línea), así que si S3 vuelve a
-disparar la Lambda con el mismo batch el item se sobrescribe en lugar de
-duplicarse.
+Solo en `SecurityAlerts`: `severity` (`HIGH` / `MEDIUM`).
 
-El GSI `event_type-index` permite consultar por tipo de evento con Query en
-lugar de recorrer toda la tabla con Scan. Es GSI y no LSI porque su
-partition key es distinta a la de la tabla.
+Solo en `Logs`: `gsi_pk = "LOG"`, partition key fija del GSI
+`last_modified-index` (sort key `last_modified`). Como todos los logs caen en
+la misma partición del índice, ordenados por la hora en que llegó su batch,
+"los últimos N" es un Query con `Limit=N` y `ScanIndexForward=false`.
 
-## Validación
+La `sk` es determinista (batch + número de línea), así que si un batch se
+reprocesa el item se sobrescribe en lugar de duplicarse.
 
-Con `./scripts/send-logs.sh 60` corriendo (un batch por minuto), todo se
-puede seguir desde la consola de AWS.
+## Decisiones de diseño
 
-**La query de la entrega.** DynamoDB > Tables > `log-events` > **Explore
-table items**:
+- **La Lambda solo parsea; Step Functions orquesta.** `parse-batch` descarga y
+  separa el batch. La clasificación, el branching y la escritura son estados
+  declarativos, visibles en el Graph view.
+- **Escritura directa a DynamoDB** con `arn:aws:states:::dynamodb:putItem`: sin
+  código intermedio ni Lambdas esperando I/O.
+- **Retry para throttling** en `WriteLog` y `WriteSecurityAlert`:
+  `ProvisionedThroughputExceededException`, `ThrottlingException`,
+  `RequestLimitExceeded`, hasta 5 intentos con backoff exponencial ×2 y jitter.
+  El Map limita su concurrencia a 10 para no generar ráfagas innecesarias.
+- **S3 → EventBridge → Step Functions**: la regla filtra `input/*.log` y
+  transforma el evento a `{"bucket", "key"}` sin código.
+- **Tablas separadas**: `SecurityAlerts` aislada de `Logs` permite retención,
+  alarmas y permisos distintos para los eventos sospechosos.
 
-1. Selecciona **Query** y, en el selector de índice, **`event_type-index`**.
-2. `event_type` = `invalid_user` > **Run**.
-3. Espera al siguiente batch y vuelve a correr la misma query: el número de
-   items crece porque están llegando logs nuevos.
+## Parte 2 (referencia histórica)
 
-**Los items de un batch en particular.** En la misma pantalla, Query sobre
-la tabla (sin índice): `pk` = `LabSZ#sshd`, y en la sort key la condición
-**Begins with** con `openssh-<timestamp>#`.
-
-**El batch original.** S3 > `logging-bucket-1321` > `input/` > clic en el
-`.log` > **Open**. Si el navegador no lo muestra, **Download**.
-
-**Los logs de la Lambda.** CloudWatch > Log groups >
-`/aws/lambda/log-processing`, con una línea por batch procesado.
+`scripts/package-lambda.sh` y `src/logging-system/` son la versión anterior,
+en la que una sola Lambda con trigger directo de S3 escribía todo a la tabla
+`log-events`. Se conservan solo como referencia; el flujo de Step Functions los
+reemplaza y `deploy.sh` no los usa.
 
 ## Equipo
 
 - Jose Pulido (jose.pulido@iteso.mx)
+- David Paez (david.paez@iteso.mx)
+- Gilberto Anaya (gilberto.anaya@iteso.mx)
