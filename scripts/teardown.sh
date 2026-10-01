@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # teardown.sh — elimina todos los recursos creados por los scripts del proyecto:
-# regla y target de EventBridge, Step Functions state machine,
+# HTTP API, regla y target de EventBridge, Step Functions state machine,
 # funciones Lambda (y sus log groups), roles IAM (solo si fueron creados por
 # este proyecto), tablas DynamoDB, notificaciones y bucket S3 (incluyendo su
 # contenido), y artefactos de build/. Al final verifica que ya no exista nada.
@@ -18,10 +18,20 @@ ROLE_NAME="${ROLE_NAME:-log-processing-lambda-role}"
 TABLE_NAME="${TABLE_NAME:-log-events}"
 
 BUILD_DIR="${SCRIPT_DIR}/../build"
-LAMBDAS=("${LAMBDA_FUNCTION_NAME}" "${FUNCTION_NAME}")
+LAMBDAS=("${LAMBDA_FUNCTION_NAME}" "${ALERTS_FUNCTION_NAME}" "${LOGS_FUNCTION_NAME}" "${FUNCTION_NAME}")
 TABLES=("${LOGS_TABLE_NAME}" "${SECURITY_ALERTS_TABLE_NAME}" "${TABLE_NAME}")
 
 echo "Cuenta: ${ACCOUNT_ID}, Región: ${AWS_REGION}"
+
+echo "== Eliminando HTTP API ${API_NAME} =="
+API_ID=$(aws apigatewayv2 get-apis \
+  --query "Items[?Name=='${API_NAME}'].ApiId | [0]" --output text 2>/dev/null || true)
+if [ -n "${API_ID}" ] && [ "${API_ID}" != "None" ]; then
+  aws apigatewayv2 delete-api --api-id "${API_ID}" \
+    && echo "Eliminado HTTP API ${API_NAME} (${API_ID})." || echo "Error al eliminar HTTP API ${API_NAME}."
+else
+  echo "HTTP API ${API_NAME} no encontrado, omitiendo."
+fi
 
 echo "== Eliminando regla y target de EventBridge =="
 aws events remove-targets --rule "${EB_RULE_NAME}" --ids "StepFunctionsTarget" >/dev/null 2>&1 || true
@@ -36,10 +46,12 @@ STATE_MACHINE_ARN=$(aws stepfunctions list-state-machines \
 if [ -n "${STATE_MACHINE_ARN}" ] && [ "${STATE_MACHINE_ARN}" != "None" ]; then
   aws stepfunctions delete-state-machine --state-machine-arn "${STATE_MACHINE_ARN}" >/dev/null 2>&1 \
     && echo "Eliminando State Machine ${STATE_MACHINE_NAME}..." || echo "Error al eliminar State Machine ${STATE_MACHINE_NAME}."
-  # El borrado es asíncrono (queda en DELETING); se espera hasta ~60s.
-  for _ in $(seq 1 30); do
+  # El borrado es asíncrono: queda en DELETING un par de minutos. Se espera
+  # hasta ~5 min para que la verificación final no la reporte como existente.
+  for _ in $(seq 1 60); do
     aws stepfunctions describe-state-machine --state-machine-arn "${STATE_MACHINE_ARN}" >/dev/null 2>&1 || break
-    sleep 2
+    echo "  ...sigue en DELETING, esperando"
+    sleep 5
   done
   echo "Eliminada State Machine ${STATE_MACHINE_NAME}."
 else
@@ -52,7 +64,7 @@ aws s3api put-bucket-notification-configuration --bucket "${BUCKET_NAME}" \
 
 echo "== Eliminando funciones Lambda y sus log groups =="
 for fn in "${LAMBDAS[@]}"; do
-  aws lambda delete-function --function-name "${fn}" 2>/dev/null \
+  aws lambda delete-function --function-name "${fn}" >/dev/null 2>&1 \
     && echo "Eliminada Lambda ${fn}." || echo "Lambda ${fn} no encontrada, omitiendo."
   aws logs delete-log-group --log-group-name "/aws/lambda/${fn}" 2>/dev/null \
     && echo "Eliminado log group /aws/lambda/${fn}." || true
@@ -80,6 +92,7 @@ delete_role() {
 
 BASIC_EXECUTION="arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 delete_role .parse-batch-role-created-by-script "${LAMBDA_ROLE_NAME}" parse-batch-s3-access "${BASIC_EXECUTION}"
+delete_role .api-role-created-by-script "${API_ROLE_NAME}" logging-api-dynamodb-read "${BASIC_EXECUTION}"
 delete_role .sfn-role-created-by-script "${SFN_ROLE_NAME}" step-functions-access
 delete_role .eb-role-created-by-script "${EB_ROLE_NAME}" eventbridge-invoke-sfn
 delete_role .role-created-by-script "${ROLE_NAME}" logging-bucket-access "${BASIC_EXECUTION}"
@@ -131,10 +144,14 @@ check_gone "Bucket s3://${BUCKET_NAME}" aws s3api head-bucket --bucket "${BUCKET
 for table in "${LOGS_TABLE_NAME}" "${SECURITY_ALERTS_TABLE_NAME}"; do
   check_gone "Tabla DynamoDB ${table}" aws dynamodb describe-table --table-name "${table}"
 done
-check_gone "Lambda ${LAMBDA_FUNCTION_NAME}" aws lambda get-function --function-name "${LAMBDA_FUNCTION_NAME}"
+for fn in "${LAMBDA_FUNCTION_NAME}" "${ALERTS_FUNCTION_NAME}" "${LOGS_FUNCTION_NAME}"; do
+  check_gone "Lambda ${fn}" aws lambda get-function --function-name "${fn}"
+done
 check_gone "State Machine ${STATE_MACHINE_NAME}" exists_query aws stepfunctions list-state-machines \
   --query "stateMachines[?name=='${STATE_MACHINE_NAME}'].name | [0]"
 check_gone "Regla EventBridge ${EB_RULE_NAME}" aws events describe-rule --name "${EB_RULE_NAME}"
+check_gone "HTTP API ${API_NAME}" exists_query aws apigatewayv2 get-apis \
+  --query "Items[?Name=='${API_NAME}'].ApiId | [0]"
 
 if [ "${REMAINING}" -eq 0 ]; then
   echo "Teardown completado: todos los recursos fueron eliminados."
