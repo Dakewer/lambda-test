@@ -1,0 +1,2 @@
+# Sin dependencias externas: boto3 (DynamoDB) ya viene incluido en el
+# runtime de Python de AWS Lambda, y lo demás es librería estándar.

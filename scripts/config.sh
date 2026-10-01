@@ -22,7 +22,7 @@ export AWS_DEFAULT_REGION="${AWS_REGION}"
 # Los nombres de bucket S3 son únicos en *todo* AWS (no por cuenta), así que el
 # default lleva el account id: cada integrante puede desplegar en su propia
 # cuenta sin chocar con los demás. El resto de los recursos (tablas, Lambdas,
-# state machine, roles, regla) solo tiene que ser único dentro de la
+# state machine, roles, regla, API) solo tiene que ser único dentro de la
 # cuenta/región, así que conservan su nombre fijo.
 BUCKET_NAME="${BUCKET_NAME:-logging-bucket-${ACCOUNT_ID}}"
 
@@ -41,6 +41,26 @@ SFN_ROLE_NAME="${SFN_ROLE_NAME:-step-functions-log-processing-role}"
 EB_RULE_NAME="${EB_RULE_NAME:-s3-log-processing-rule}"
 EB_ROLE_NAME="${EB_ROLE_NAME:-eventbridge-step-functions-role}"
 
+# API Gateway (HTTP API) + Lambdas de consulta
+API_NAME="${API_NAME:-logging-api}"
+ALERTS_FUNCTION_NAME="${ALERTS_FUNCTION_NAME:-get-alerts}"
+LOGS_FUNCTION_NAME="${LOGS_FUNCTION_NAME:-get-logs}"
+API_ROLE_NAME="${API_ROLE_NAME:-logging-api-lambda-role}"
+
 # Rol pre-aprovisionado que se usa cuando la cuenta no permite iam:CreateRole
 # (AWS Academy).
 FALLBACK_ROLE_NAME="${FALLBACK_ROLE_NAME:-LabRole}"
+
+# explain_role_error <rol> <archivo con el stderr de create-role>
+# En AWS Academy create-role siempre falla con AccessDenied: es esperado, así
+# que basta una línea en lugar del error completo. Cualquier otro error sí se
+# muestra tal cual.
+explain_role_error() {
+  local role="$1" err_file="$2"
+  if grep -q "AccessDenied" "${err_file}"; then
+    echo "AWS Academy no permite crear roles IAM (es lo esperado)."
+  else
+    echo "No se pudo crear el rol '${role}':"
+    cat "${err_file}"
+  fi
+}
