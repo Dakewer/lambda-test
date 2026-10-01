@@ -2,7 +2,7 @@
 
 Cada alerta sale con id, timestamp, host, log y severity:
 
-    {"id": "openssh-1790032937#00003", "timestamp": "Dec 10 06:55:46",
+    {"id": "openssh-1790032937-0004#00003", "timestamp": "Dec 10 06:55:46",
      "host": "LabSZ", "log": "Invalid user webmaster from 173.234.31.186",
      "severity": "MEDIUM"}
 
@@ -39,7 +39,7 @@ def scan_all() -> list[dict]:
 
 
 def lambda_handler(event, context):
-    # sk = <batch_id>#<linea> y batch_id = openssh-<epoch>, así que ordenar por
+    # sk = <batch_id>#<linea> y batch_id = openssh-<epoch>-<índice>, así que ordenar por
     # sk descendente deja las alertas más recientes primero.
     items = sorted(scan_all(), key=lambda item: item["sk"], reverse=True)
     alerts = [to_alert(item) for item in items]

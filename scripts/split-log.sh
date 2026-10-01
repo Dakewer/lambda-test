@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # split-log.sh — reads a log file line by line, and every time ~1KB has been
 # accumulated it flushes that chunk to its own batch file named
-# openssh-<timestamp>.log, ready to be uploaded to S3.
+# openssh-<epoch de la corrida>-<índice>.log, ready to be uploaded to S3.
+# The run epoch keeps names from different runs from colliding (which would
+# overwrite S3 objects and DynamoDB items), and the zero-padded index keeps
+# lexicographic order == upload order.
 #
 # Usage:
 #   ./scripts/split-log.sh [source_log] [output_dir] [max_bytes]
@@ -31,7 +34,8 @@ CURRENT_SIZE=0
 
 flush_batch() {
   if [ -n "${CURRENT_BATCH}" ]; then
-    local fname="${OUTPUT_DIR}/openssh-$((BASE_TS + BATCH_INDEX)).log"
+    local fname
+    fname="${OUTPUT_DIR}/$(printf 'openssh-%s-%04d.log' "${BASE_TS}" "${BATCH_INDEX}")"
     printf '%s' "${CURRENT_BATCH}" > "${fname}"
     echo "Wrote ${fname} ($(wc -c < "${fname}") bytes)"
     BATCH_INDEX=$((BATCH_INDEX + 1))

@@ -55,7 +55,7 @@ flowchart LR
 │   ├── deploy-state-machine.sh      #   Lambda parse-batch, Step Functions, regla EventBridge
 │   ├── deploy-api.sh                #   Lambdas get-alerts / get-logs y HTTP API
 │   ├── start_logging.sh             # parte el log en batches y los sube cada N segundos
-│   ├── split-log.sh                 #   parte el log en batches de ~1KB (batches/openssh-<ts>.log)
+│   ├── split-log.sh                 #   parte el log en batches de ~1KB (batches/openssh-<ts>-<n>.log)
 │   ├── send-logs.sh                 #   sube los batches a S3 cada N segundos
 │   ├── teardown.sh                  # elimina todo y verifica que no quede nada
 │   └── package-lambda.sh            # Parte 2 (referencia histórica, ya no se usa)
@@ -156,9 +156,9 @@ recientes primero:
 {
   "count": 2,
   "alerts": [
-    {"id": "openssh-1790032937#00002", "timestamp": "Dec 10 06:55:46", "host": "LabSZ",
+    {"id": "openssh-1790032937-0004#00002", "timestamp": "Dec 10 06:55:46", "host": "LabSZ",
      "log": "Invalid user webmaster from 173.234.31.186", "severity": "MEDIUM"},
-    {"id": "openssh-1790032937#00001", "timestamp": "Dec 10 06:55:46", "host": "LabSZ",
+    {"id": "openssh-1790032937-0004#00001", "timestamp": "Dec 10 06:55:46", "host": "LabSZ",
      "log": "reverse mapping checking getaddrinfo for ns.marryaldkfaczcz.com [173.234.31.186] failed - POSSIBLE BREAK-IN ATTEMPT!",
      "severity": "HIGH"}
   ]
@@ -172,13 +172,16 @@ recientes primero:
 
 `GET /logs?top=N` regresa los últimos `N` logs de `Logs` (default 10, máximo
 1000). No hace Scan: es un `Query` al GSI `last_modified-index` con
-`Limit=N` y `ScanIndexForward=false`.
+`Limit=N` y `ScanIndexForward=false`. Como todas las líneas de un batch
+comparten el mismo `LastModified`, si el `Limit` corta a la mitad de un batch la
+Lambda hace un segundo Query solo por ese `LastModified` y se queda con sus
+líneas más recientes, para que el resultado sea exacto.
 
 ```json
 {
   "top": 5, "count": 5,
   "logs": [
-    {"id": "openssh-1790032940#00004", "timestamp": "Dec 10 07:02:47", "host": "LabSZ",
+    {"id": "openssh-1790032937-0007#00004", "timestamp": "Dec 10 07:02:47", "host": "LabSZ",
      "log": "Received disconnect from 173.234.31.186: 11: Bye Bye [preauth]",
      "event_type": "disconnect", "last_modified": "2026-09-29T18:31:05Z"}
   ]
@@ -233,7 +236,7 @@ Un item por línea de log. Ambas tablas comparten el esquema base:
 | Atributo           | Ejemplo                        | Notas                                         |
 | ------------------ | ------------------------------ | --------------------------------------------- |
 | `pk`               | `LabSZ#sshd`                   | Partition key: `<hostname>#<program>`         |
-| `sk`               | `openssh-1790032937#00007`     | Sort key: `<batch_id>#<línea>` (es el `id` del API) |
+| `sk`               | `openssh-1790032937-0004#00007`     | Sort key: `<batch_id>#<línea>` (es el `id` del API) |
 | `event_type`       | `invalid_user`                 | Partition key del GSI `event_type-index`      |
 | `ingested_at`      | `2026-09-29T18:31:06Z`         | Hora en que se procesó; sort key de `event_type-index` |
 | `last_modified`    | `2026-09-29T18:31:05Z`         | `LastModified` del batch en S3 (hora real de llegada) |

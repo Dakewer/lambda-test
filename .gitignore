@@ -4,3 +4,4 @@ batches/
 OpenSSH_2k.log
 __pycache__/
 *.pyc
+.atl/

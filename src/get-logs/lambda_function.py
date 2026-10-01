@@ -38,6 +38,20 @@ def to_log(item: dict) -> dict:
     }
 
 
+def query_same_last_modified(last_modified: str) -> list[dict]:
+    items = []
+    kwargs = {
+        "IndexName": INDEX_NAME,
+        "KeyConditionExpression": Key("gsi_pk").eq(GSI_PK) & Key("last_modified").eq(last_modified),
+    }
+    while True:
+        page = table.query(**kwargs)
+        items.extend(page["Items"])
+        if "LastEvaluatedKey" not in page:
+            return items
+        kwargs["ExclusiveStartKey"] = page["LastEvaluatedKey"]
+
+
 def lambda_handler(event, context):
     params = event.get("queryStringParameters") or {}
     try:
@@ -47,15 +61,20 @@ def lambda_handler(event, context):
     if not 1 <= top <= MAX_TOP:
         return response(400, {"error": f"top debe estar entre 1 y {MAX_TOP}"})
 
-    result = table.query(
+    items = table.query(
         IndexName=INDEX_NAME,
         KeyConditionExpression=Key("gsi_pk").eq(GSI_PK),
         ScanIndexForward=False,
         Limit=top,
-    )
+    )["Items"]
+
     # Todas las líneas de un batch comparten el mismo LastModified y DynamoDB
-    # no garantiza su orden entre sí; se desempata por id (<batch>#<línea>).
-    items = sorted(result["Items"], key=lambda item: (item["last_modified"], item["sk"]), reverse=True)
+    # no garantiza su orden entre sí: si el Limit corta a la mitad de un batch,
+    # se traen las demás líneas de ese último batch para quedarse con las
+    # más recientes, y se desempata por id (<batch>#<línea>).
+    if len(items) == top:
+        items = {item["sk"]: item for item in items + query_same_last_modified(items[-1]["last_modified"])}.values()
+    items = sorted(items, key=lambda item: (item["last_modified"], item["sk"]), reverse=True)[:top]
     logs = [to_log(item) for item in items]
 
     return response(200, {"top": top, "count": len(logs), "logs": logs})

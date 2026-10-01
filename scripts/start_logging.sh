@@ -19,6 +19,11 @@ if [ $# -lt 1 ]; then
   exit 1
 fi
 
+if ! [[ "$1" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: <segundos_entre_batches> debe ser un entero (recibido: '$1')." >&2
+  exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="${SCRIPT_DIR}/.."
 
