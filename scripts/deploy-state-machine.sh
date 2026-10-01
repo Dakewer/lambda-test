@@ -93,8 +93,7 @@ else
     echo "Esperando propagación del rol IAM..."
     sleep 10
   else
-    echo "No se pudo crear el rol '${LAMBDA_ROLE_NAME}' (posible restricción de AWS Academy)."
-    cat /tmp/create-lambda-role.err
+    explain_role_error "${LAMBDA_ROLE_NAME}" /tmp/create-lambda-role.err
     if aws iam get-role --role-name "${FALLBACK_ROLE_NAME}" >/dev/null 2>&1; then
       echo "Usando rol fallback '${FALLBACK_ROLE_NAME}'."
       LAMBDA_ROLE_NAME="${FALLBACK_ROLE_NAME}"
@@ -177,8 +176,7 @@ else
     echo "Esperando propagación del rol IAM de Step Functions..."
     sleep 10
   else
-    echo "No se pudo crear el rol '${SFN_ROLE_NAME}' (posible restricción de AWS Academy)."
-    cat /tmp/create-sfn-role.err
+    explain_role_error "${SFN_ROLE_NAME}" /tmp/create-sfn-role.err
     if aws iam get-role --role-name "${FALLBACK_ROLE_NAME}" >/dev/null 2>&1; then
       echo "Usando rol fallback '${FALLBACK_ROLE_NAME}' para Step Functions."
       SFN_ROLE_NAME="${FALLBACK_ROLE_NAME}"
@@ -269,8 +267,7 @@ else
     echo "Esperando propagación del rol IAM de EventBridge..."
     sleep 10
   else
-    echo "No se pudo crear el rol '${EB_ROLE_NAME}' (posible restricción de AWS Academy)."
-    cat /tmp/create-eb-role.err
+    explain_role_error "${EB_ROLE_NAME}" /tmp/create-eb-role.err
     if aws iam get-role --role-name "${FALLBACK_ROLE_NAME}" >/dev/null 2>&1; then
       echo "Usando rol fallback '${FALLBACK_ROLE_NAME}' para EventBridge."
       EB_ROLE_NAME="${FALLBACK_ROLE_NAME}"
